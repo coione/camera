@@ -1,0 +1,19 @@
+[Unit]
+Description=Raspberry Pi Camera Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=video
+WorkingDirectory=/home/pi/Projects/camera
+EnvironmentFile=/home/pi/Projects/camera/.env
+ExecStart=/home/pi/Projects/camera/venv/bin/python /home/pi/Projects/camera/camera_bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
