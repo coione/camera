@@ -72,8 +72,21 @@ All settings are controlled via environment variables (`.env` file):
 | `MOTION_MIN_AREA` | `3000` | Minimum contour area in pixels² to trigger an alert |
 | `MOTION_COOLDOWN` | `10` | Minimum seconds between consecutive motion alerts |
 | `VIDEO_DURATION` | `5` | Length in seconds of motion clips and `/video` captures |
+| `CAMERA_AUTOFOCUS` | `false` | Leave the sensor's continuous autofocus on (causes false alerts) |
+| `CAMERA_FOCUS` | *(sweep)* | Fixed focus position `1`–`1023`; unset runs a one-shot sweep at startup |
+| `MOTION_MAX_FOCUS_SHIFT` | `1.6` | Reject a reading when image sharpness swings by more than this factor |
+| `MOTION_MAX_CHANGE_RATIO` | `0.5` | Reject a reading when more than this fraction of the frame changes at once |
+| `MOTION_CONSEC_FRAMES` | `3` | Readings in a row (~0.1 s each) that must show motion before alerting |
 
 Increase `MOTION_MIN_AREA` to reduce false positives from lighting changes. Increase `MOTION_COOLDOWN` to limit alert frequency. Note that each alert now records for `VIDEO_DURATION` seconds, during which no new motion is detected, so the effective gap between alerts is roughly `MOTION_COOLDOWN` + `VIDEO_DURATION`.
+
+### Focus and false positives
+
+Continuous autofocus is a major source of false motion alerts: each refocus takes the whole frame from blurry to sharp, which frame-difference analysis reads as a large moving object. A fixed camera never needs to refocus, so autofocus is disabled at startup and the lens is locked.
+
+Because the UVC driver never reports the position its own autofocus settles on, the bot finds one itself: a coarse-to-fine sweep of the focus range, keeping the sharpest position. This takes about ten seconds, once, at startup — the log line `Autofocus sweep chose focus N` reports the result. Set `CAMERA_FOCUS=N` to skip the sweep on later starts, and re-run it (by unsetting it and restarting) whenever the camera is moved or re-aimed.
+
+Three filters then guard against whatever global changes remain — an auto-exposure step, a light being switched on. The one that matters for focus is `MOTION_MAX_FOCUS_SHIFT`: objects move through a frame without changing how well it is focused, so a sharpness swing means the lens or the lighting, not the scene. On the reference camera a static scene holds `1.01x` and a large moving object `1.19x`, while a refocus spikes to `6.2x`. Lower the threshold towards `1.3` if refocus alerts still slip through; raise it if genuine motion is being suppressed.
 
 ## Commands
 

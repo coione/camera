@@ -37,12 +37,39 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 BOT_TOKEN       = _require_env("TELEGRAM_BOT_TOKEN")
 CHAT_ID         = _require_env("TELEGRAM_CHAT_ID")
 CAMERA_INDEX    = int(os.getenv("CAMERA_INDEX", "0"))
 MOTION_MIN_AREA = int(os.getenv("MOTION_MIN_AREA", "3000"))  # pixels²
 MOTION_COOLDOWN = int(os.getenv("MOTION_COOLDOWN", "10"))    # seconds between alerts
 VIDEO_DURATION  = int(os.getenv("VIDEO_DURATION", "5"))      # seconds captured by /video
+
+# Continuous autofocus is the main source of false motion alerts: each refocus
+# takes the entire frame from blurry to sharp at once, which frame-difference
+# analysis cannot tell apart from a large moving object. A fixed camera never
+# needs to refocus, so the lens is pinned at startup instead.
+CAMERA_AUTOFOCUS = _env_bool("CAMERA_AUTOFOCUS", False)      # true restores continuous AF
+_focus_env       = os.getenv("CAMERA_FOCUS")
+CAMERA_FOCUS     = int(_focus_env) if _focus_env else None   # unset → sweep for it at startup
+
+# Backstops for the global changes that survive a locked lens — an exposure or
+# white-balance step, a light switched on, a refocus if autofocus is re-enabled.
+#   MAX_CHANGE_RATIO — reject when this fraction of the frame changes at once.
+#   MAX_FOCUS_SHIFT  — reject when image sharpness jumps by this factor between
+#     readings. Measured on this camera: a static scene holds 1.01x and a large
+#     moving object 1.19x, while a refocus spikes to 6.2x — so the sharpness
+#     jump, not the changed area, is what actually separates focus from motion.
+#   CONSEC_FRAMES    — readings in a row that must show motion before alerting.
+MOTION_MAX_CHANGE_RATIO = float(os.getenv("MOTION_MAX_CHANGE_RATIO", "0.5"))
+MOTION_MAX_FOCUS_SHIFT  = float(os.getenv("MOTION_MAX_FOCUS_SHIFT", "1.6"))
+MOTION_CONSEC_FRAMES    = int(os.getenv("MOTION_CONSEC_FRAMES", "3"))
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -69,6 +96,20 @@ _frame_lock = threading.Lock()
 
 _motion_enabled = threading.Event()
 _motion_enabled.set()  # on by default
+
+# ---------------------------------------------------------------------------
+# Shutdown signal — set by the post_shutdown hook so the motion thread can
+# leave its loop and release the camera before the interpreter finalises.
+#
+# Letting the daemon thread simply be killed aborts the process: CPython stops
+# it by unwinding out of whatever call it is in, and it is almost always inside
+# an OpenCV call, which is C++. Unwinding through a C++ frame that has no
+# handler reaches std::terminate, so the process dies with SIGABRT and
+# "FATAL: exception not rethrown" instead of exiting cleanly.
+# ---------------------------------------------------------------------------
+
+_shutdown = threading.Event()
+_motion_thread: threading.Thread | None = None
 
 # ---------------------------------------------------------------------------
 # /video requests — enqueued by the command handler (asyncio side), drained
@@ -110,7 +151,7 @@ def _record_clip(cap: "cv2.VideoCapture", duration: float) -> str | None:
     """
     frames = []
     start = time.monotonic()
-    while time.monotonic() - start < duration:
+    while time.monotonic() - start < duration and not _shutdown.is_set():
         ret, frame = cap.read()
         if not ret:
             break
@@ -159,8 +200,131 @@ def _record_clip(cap: "cv2.VideoCapture", duration: float) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Focus control
+#
+# Resolved once per process and reapplied on every camera (re)open, so a
+# mid-run reconnect never costs another sweep.
+# ---------------------------------------------------------------------------
+
+FOCUS_MIN, FOCUS_MAX   = 1, 1023
+FOCUS_SETTLE_SECONDS   = 0.35  # time for the lens motor to reach a position
+FOCUS_SETTLE_FRAMES    = 5     # buffered frames to discard after it moves
+
+_locked_focus: int | None = None
+_focus_resolved = False
+
+
+def _focus_measure(gray) -> float:
+    """
+    Variance of the Laplacian — the standard focus measure. Higher means
+    sharper. Must be given an unblurred grayscale frame; the 21x21 blur the
+    motion detector applies would erase exactly the detail this reads.
+    """
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+
+def _sharpness(cap: "cv2.VideoCapture") -> float:
+    """Focus measure of the next settled frame, discarding buffered ones."""
+    for _ in range(FOCUS_SETTLE_FRAMES):
+        cap.grab()
+    ret, frame = cap.read()
+    if not ret:
+        return -1.0
+    return _focus_measure(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+
+
+def _autofocus_sweep(cap: "cv2.VideoCapture") -> int | None:
+    """
+    One-shot software autofocus: steps the lens across its range and keeps the
+    position that produces the sharpest image.
+
+    Freezing the sensor's own continuous autofocus would be simpler, but the
+    UVC driver never reports the position it settles on — focus_absolute stays
+    flagged `inactive` while autofocus is on — so the position has to be found
+    here. Takes roughly ten seconds, once, at startup. Returns None if the
+    camera rejects manual focus.
+    """
+    best_focus: int | None = None
+    best_score = -1.0
+
+    def scan(positions) -> bool:
+        nonlocal best_focus, best_score
+        for pos in positions:
+            if _shutdown.is_set():
+                break
+            if not cap.set(cv2.CAP_PROP_FOCUS, pos):
+                return False
+            time.sleep(FOCUS_SETTLE_SECONDS)
+            score = _sharpness(cap)
+            logger.debug("focus %4d → sharpness %.1f", pos, score)
+            if score > best_score:
+                best_focus, best_score = pos, score
+        return True
+
+    logger.info("Running autofocus sweep — this takes a few seconds")
+    coarse_step = (FOCUS_MAX - FOCUS_MIN) // 8
+    if not scan(range(FOCUS_MIN, FOCUS_MAX + 1, coarse_step)) or best_focus is None:
+        if not _shutdown.is_set():
+            logger.warning("Camera rejected manual focus — leaving focus untouched")
+        return None
+
+    # Refine around the coarse winner.
+    scan(range(
+        max(best_focus - coarse_step, FOCUS_MIN),
+        min(best_focus + coarse_step, FOCUS_MAX) + 1,
+        max(coarse_step // 4, 1),
+    ))
+
+    logger.info("Autofocus sweep chose focus %d (sharpness %.1f)", best_focus, best_score)
+    return best_focus
+
+
+def _configure_camera(cap: "cv2.VideoCapture") -> None:
+    """
+    Pins the lens so the sensor stops refocusing on its own, which is what
+    produces the whole-frame changes the motion detector misreads as movement.
+    Safe to call again after a reconnect.
+    """
+    global _locked_focus, _focus_resolved
+
+    if CAMERA_AUTOFOCUS:
+        cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+        logger.info("Continuous autofocus left ON (CAMERA_AUTOFOCUS=true)")
+        return
+
+    if not cap.set(cv2.CAP_PROP_AUTOFOCUS, 0):
+        logger.warning("Camera does not support disabling autofocus")
+        return
+    logger.info("Continuous autofocus disabled")
+
+    if not _focus_resolved:
+        _locked_focus = CAMERA_FOCUS if CAMERA_FOCUS is not None else _autofocus_sweep(cap)
+        _focus_resolved = True
+
+    if _locked_focus is not None:
+        cap.set(cv2.CAP_PROP_FOCUS, _locked_focus)
+        # Let the motor arrive, then drop the frames the driver buffered while
+        # it was still moving — otherwise the loop's first comparison is made
+        # against a stale, differently-focused frame and trips its own filter.
+        time.sleep(FOCUS_SETTLE_SECONDS)
+        for _ in range(FOCUS_SETTLE_FRAMES):
+            cap.grab()
+        logger.info("Focus locked at %d", _locked_focus)
+
+
+# ---------------------------------------------------------------------------
 # Motion-detection thread
 # ---------------------------------------------------------------------------
+
+def _reference(frame):
+    """
+    The pair of values the next frame is compared against: the blurred
+    grayscale image for differencing, and the focus measure (which needs the
+    unblurred image) for spotting lens and lighting changes.
+    """
+    gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.GaussianBlur(gray_full, (21, 21), 0), _focus_measure(gray_full)
+
 
 def motion_detection_loop(bot, loop: asyncio.AbstractEventLoop) -> None:
     """
@@ -179,6 +343,7 @@ def motion_detection_loop(bot, loop: asyncio.AbstractEventLoop) -> None:
 
     logger.info("Camera opened (index=%d)", CAMERA_INDEX)
     time.sleep(1.0)  # allow the sensor to auto-adjust exposure/white-balance
+    _configure_camera(cap)
 
     ret, frame = cap.read()
     if not ret:
@@ -187,17 +352,18 @@ def motion_detection_loop(bot, loop: asyncio.AbstractEventLoop) -> None:
         return
 
     _set_frame(frame)
-    prev_gray = cv2.GaussianBlur(
-        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (21, 21), 0
-    )
+    prev_gray, prev_sharpness = _reference(frame)
     last_alert: float = 0.0
+    consecutive: int = 0  # readings in a row showing motion
 
     logger.info(
-        "Motion detection active (min_area=%d px², cooldown=%d s)",
-        MOTION_MIN_AREA, MOTION_COOLDOWN,
+        "Motion detection active (min_area=%d px², cooldown=%d s, "
+        "confirm=%d frames, max_change=%.0f%%, max_focus_shift=%.1fx)",
+        MOTION_MIN_AREA, MOTION_COOLDOWN, MOTION_CONSEC_FRAMES,
+        MOTION_MAX_CHANGE_RATIO * 100, MOTION_MAX_FOCUS_SHIFT,
     )
 
-    while True:
+    while not _shutdown.is_set():
         try:
             chat_id = _video_requests.get_nowait()
         except queue.Empty:
@@ -225,27 +391,32 @@ def motion_detection_loop(bot, loop: asyncio.AbstractEventLoop) -> None:
                 finally:
                     os.remove(p)
 
+            if _shutdown.is_set():
+                # Shutdown cut the recording short; the event loop is going
+                # away, so there is nothing left to send the clip to.
+                if path:
+                    os.remove(path)
+                break
+
             asyncio.run_coroutine_threadsafe(_send_clip(), loop)
 
             # Recording paused frame reads for VIDEO_DURATION seconds — the
             # previous grayscale reference is stale, so refresh it.
+            consecutive = 0
             ret, frame = cap.read()
             if ret:
                 _set_frame(frame)
-                prev_gray = cv2.GaussianBlur(
-                    cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (21, 21), 0
-                )
+                prev_gray, prev_sharpness = _reference(frame)
             continue
 
         if not _motion_enabled.is_set():
             # Detection is paused — keep reading frames so _latest_frame stays
             # fresh (for /photo) and to avoid stale prev_gray on resume.
+            consecutive = 0
             ret, frame = cap.read()
             if ret:
                 _set_frame(frame)
-                prev_gray = cv2.GaussianBlur(
-                    cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (21, 21), 0
-                )
+                prev_gray, prev_sharpness = _reference(frame)
             time.sleep(0.1)
             continue
 
@@ -255,24 +426,58 @@ def motion_detection_loop(bot, loop: asyncio.AbstractEventLoop) -> None:
             cap.release()
             time.sleep(2.0)
             cap = cv2.VideoCapture(CAMERA_INDEX)
+            _configure_camera(cap)
             continue
 
         _set_frame(frame)
 
         # Frame-difference motion detection
-        gray   = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (21, 21), 0)
+        gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sharpness = _focus_measure(gray_full)
+        gray   = cv2.GaussianBlur(gray_full, (21, 21), 0)
         delta  = cv2.absdiff(prev_gray, gray)
         thresh = cv2.threshold(delta, 25, 255, cv2.THRESH_BINARY)[1]
         thresh = cv2.dilate(thresh, None, iterations=2)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         prev_gray = gray
 
+        # How far sharpness swung since the last reading, as a ratio ≥ 1.
+        focus_shift = (
+            max(sharpness, prev_sharpness) / max(min(sharpness, prev_sharpness), 1e-6)
+        )
+        prev_sharpness = sharpness
+
+        changed_ratio = cv2.countNonZero(thresh) / thresh.size
+        if focus_shift > MOTION_MAX_FOCUS_SHIFT:
+            # The whole image got sharper or blurrier at once. Objects move
+            # through the frame without changing how well it is focused, so
+            # this is the lens or the lighting, not something in the scene.
+            logger.info(
+                "Ignoring %.1fx sharpness jump (lens or lighting change) — not motion",
+                focus_shift,
+            )
+            consecutive = 0
+        elif changed_ratio > MOTION_MAX_CHANGE_RATIO:
+            # Most of the frame changed in a single step. Real movement is
+            # localised, so this is a global event — an exposure or
+            # white-balance correction, a light being switched on.
+            logger.info(
+                "Ignoring global frame change (%.0f%% of pixels) — not motion",
+                changed_ratio * 100,
+            )
+            consecutive = 0
+        elif any(cv2.contourArea(c) > MOTION_MIN_AREA for c in contours):
+            consecutive += 1
+        else:
+            consecutive = 0
+
         now = time.monotonic()
         if (
-            any(cv2.contourArea(c) > MOTION_MIN_AREA for c in contours)
+            consecutive >= MOTION_CONSEC_FRAMES
             and now - last_alert >= MOTION_COOLDOWN
         ):
             last_alert = now
+            consecutive = 0
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             logger.info("Motion detected — recording %ds clip", VIDEO_DURATION)
             try:
@@ -298,6 +503,11 @@ def motion_detection_loop(bot, loop: asyncio.AbstractEventLoop) -> None:
                 finally:
                     os.remove(p)
 
+            if _shutdown.is_set():
+                if path:
+                    os.remove(path)
+                break
+
             asyncio.run_coroutine_threadsafe(_alert(), loop)
 
             # Recording consumed VIDEO_DURATION seconds of frames, so the
@@ -305,11 +515,12 @@ def motion_detection_loop(bot, loop: asyncio.AbstractEventLoop) -> None:
             ret, frame = cap.read()
             if ret:
                 _set_frame(frame)
-                prev_gray = cv2.GaussianBlur(
-                    cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (21, 21), 0
-                )
+                prev_gray, prev_sharpness = _reference(frame)
 
         time.sleep(0.1)  # ~10 fps polling rate
+
+    cap.release()
+    logger.info("Motion-detection thread stopped, camera released")
 
 
 # ---------------------------------------------------------------------------
@@ -377,14 +588,18 @@ async def _post_init(application: Application) -> None:
     polling begins. The running event loop is already available here, so
     this is the correct place to start the motion-detection thread.
     """
+    global _motion_thread
+
     loop = asyncio.get_running_loop()
-    thread = threading.Thread(
+    # Still a daemon: if the join in _post_shutdown ever times out, the process
+    # must be able to exit anyway rather than hang.
+    _motion_thread = threading.Thread(
         target=motion_detection_loop,
         args=(application.bot, loop),
         name="motion-detection",
         daemon=True,
     )
-    thread.start()
+    _motion_thread.start()
     logger.info("Motion-detection thread started")
 
     await application.bot.set_my_commands([
@@ -396,11 +611,29 @@ async def _post_init(application: Application) -> None:
     ])
 
 
+async def _post_shutdown(application: Application) -> None:
+    """
+    Called by python-telegram-bot once polling has stopped, while the
+    interpreter is still healthy. Stops the motion thread here so it is never
+    killed mid-OpenCV-call during finalisation, which aborts the process.
+    """
+    if _motion_thread is None:
+        return
+
+    _shutdown.set()
+    # A recording in progress is the slow case; _record_clip checks the same
+    # flag, so the thread returns shortly after its current camera read.
+    _motion_thread.join(timeout=VIDEO_DURATION + 3)
+    if _motion_thread.is_alive():
+        logger.warning("Motion-detection thread did not stop in time")
+
+
 def main() -> None:
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
         .build()
     )
     app.add_handler(CommandHandler("start",          cmd_start))
