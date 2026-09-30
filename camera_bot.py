@@ -102,6 +102,33 @@ CAMERA_FOCUS     = int(_focus_env) if _focus_env else None   # unset → sweep f
 #   CONSEC_FRAMES    — readings in a row that must show motion before alerting.
 MOTION_MAX_CHANGE_RATIO = float(os.getenv("MOTION_MAX_CHANGE_RATIO", "0.5"))
 MOTION_MAX_FOCUS_SHIFT  = float(os.getenv("MOTION_MAX_FOCUS_SHIFT", "1.6"))
+
+# The brightness difference that counts as a changed pixel, derived from the
+# noise the camera is actually producing rather than fixed.
+#
+# A fixed 25 was far above the noise floor — measured on a static scene, the
+# frame-to-frame difference peaks at 3 grey levels — and sensitivity tracks
+# the threshold one for one, so 25 could only ever see objects differing by
+# 25 levels or more. That is the night problem: darkness compresses contrast,
+# so a person at night differs from the background by far less than that.
+# Tying the threshold to measured noise keeps the daytime margin while
+# recovering the sensitivity, and still rises if a gained-up night sensor
+# turns out to be noisy. The ceiling is the old fixed value, so detection can
+# never end up less sensitive than it was before.
+MOTION_THRESHOLD_MAX = int(os.getenv("MOTION_THRESHOLD_MAX", "25"))
+MOTION_THRESHOLD_MIN = int(os.getenv("MOTION_THRESHOLD_MIN", "6"))
+MOTION_NOISE_MARGIN  = float(os.getenv("MOTION_NOISE_MARGIN", "4.0"))
+
+# Attack/decay for the noise estimate: react quickly when the scene gets
+# noisier (raising the threshold protects against false alerts) and relax
+# slowly, so one quiet moment cannot make the detector jumpy.
+NOISE_RISE = 0.2
+NOISE_FALL = 0.01
+
+# Lets the sensor trade frame rate for exposure time when light is low, so it
+# can actually gather enough light after dark. UVC exposes this as a V4L2
+# control with no OpenCV property, so it is set through v4l2-ctl.
+CAMERA_LOW_LIGHT = _env_bool("CAMERA_LOW_LIGHT", True)
 MOTION_CONSEC_FRAMES    = int(os.getenv("MOTION_CONSEC_FRAMES", "3"))
 
 # ---------------------------------------------------------------------------
@@ -312,6 +339,28 @@ def _autofocus_sweep(cap: "cv2.VideoCapture") -> int | None:
     return best_focus
 
 
+def _set_v4l2_control(name: str, value: int) -> bool:
+    """
+    Sets a V4L2 control that OpenCV exposes no property for. Non-fatal: a
+    missing v4l2-ctl or an unsupported control only costs the tuning.
+    """
+    try:
+        proc = subprocess.run(
+            ["v4l2-ctl", "-d", f"/dev/video{CAMERA_INDEX}", f"--set-ctrl={name}={value}"],
+            capture_output=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Could not run v4l2-ctl to set %s: %s", name, exc)
+        return False
+    if proc.returncode != 0:
+        logger.warning(
+            "Camera rejected %s=%s: %s", name, value,
+            proc.stderr.decode(errors="replace").strip(),
+        )
+        return False
+    return True
+
+
 def _configure_camera(cap: "cv2.VideoCapture") -> None:
     """
     Pins the lens so the sensor stops refocusing on its own, which is what
@@ -319,6 +368,9 @@ def _configure_camera(cap: "cv2.VideoCapture") -> None:
     Safe to call again after a reconnect.
     """
     global _locked_focus, _focus_resolved
+
+    if CAMERA_LOW_LIGHT and _set_v4l2_control("exposure_dynamic_framerate", 1):
+        logger.info("Low-light mode on: sensor may lengthen exposure after dark")
 
     if CAMERA_AUTOFOCUS:
         cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
@@ -388,6 +440,10 @@ def motion_detection_loop(bot, loop: asyncio.AbstractEventLoop) -> None:
     prev_gray, prev_sharpness = _reference(frame)
     last_alert: float = 0.0
     consecutive: int = 0  # readings in a row showing motion
+    # Start at the old fixed threshold and let quiet frames relax it downwards,
+    # so a noisy camera is never handed a sensitive detector before measuring.
+    noise_peak: float = MOTION_THRESHOLD_MAX / MOTION_NOISE_MARGIN
+    logged_threshold: int = 0
 
     logger.info(
         "Motion detection active (min_area=%d px², cooldown=%d s, "
@@ -469,7 +525,17 @@ def motion_detection_loop(bot, loop: asyncio.AbstractEventLoop) -> None:
         sharpness = _focus_measure(gray_full)
         gray   = cv2.GaussianBlur(gray_full, (21, 21), 0)
         delta  = cv2.absdiff(prev_gray, gray)
-        thresh = cv2.threshold(delta, 25, 255, cv2.THRESH_BINARY)[1]
+        pixel_threshold = int(min(
+            max(MOTION_NOISE_MARGIN * noise_peak, MOTION_THRESHOLD_MIN),
+            MOTION_THRESHOLD_MAX,
+        ))
+        if pixel_threshold != logged_threshold:
+            logger.info(
+                "Pixel threshold now %d (noise peak %.1f, scene brightness %.0f)",
+                pixel_threshold, noise_peak, gray_full.mean(),
+            )
+            logged_threshold = pixel_threshold
+        thresh = cv2.threshold(delta, pixel_threshold, 255, cv2.THRESH_BINARY)[1]
         thresh = cv2.dilate(thresh, None, iterations=2)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         prev_gray = gray
@@ -503,6 +569,12 @@ def motion_detection_loop(bot, loop: asyncio.AbstractEventLoop) -> None:
             consecutive += 1
         else:
             consecutive = 0
+            # Nothing is happening, so whatever this frame differs by is the
+            # camera's own noise. Learning it only from quiet frames keeps
+            # real movement out of the estimate.
+            peak = cv2.minMaxLoc(delta)[1]
+            alpha = NOISE_RISE if peak > noise_peak else NOISE_FALL
+            noise_peak += alpha * (peak - noise_peak)
 
         now = time.monotonic()
         if (

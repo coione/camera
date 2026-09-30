@@ -16,7 +16,7 @@ A Python service that watches a USB camera for motion and sends a short video cl
 
 ```bash
 sudo apt update
-sudo apt install -y python3-venv libglib2.0-0 ffmpeg
+sudo apt install -y python3-venv libglib2.0-0 ffmpeg v4l-utils
 ```
 
 `ffmpeg` is required to encode motion clips and `/video` captures as H.264/MP4 so Telegram clients can play them inline.
@@ -78,6 +78,10 @@ All settings are controlled via environment variables (`.env` file):
 | `MOTION_MAX_FOCUS_SHIFT` | `1.6` | Reject a reading when image sharpness swings by more than this factor |
 | `MOTION_MAX_CHANGE_RATIO` | `0.5` | Reject a reading when more than this fraction of the frame changes at once |
 | `MOTION_CONSEC_FRAMES` | `3` | Readings in a row (~0.1 s each) that must show motion before alerting |
+| `MOTION_THRESHOLD_MAX` | `25` | Upper bound on the per-pixel difference that counts as changed |
+| `MOTION_THRESHOLD_MIN` | `6` | Lower bound on that threshold, however quiet the camera is |
+| `MOTION_NOISE_MARGIN` | `4.0` | Threshold is this many times the measured noise peak |
+| `CAMERA_LOW_LIGHT` | `true` | Let the sensor trade frame rate for exposure time in the dark |
 
 Increase `MOTION_MIN_AREA` to reduce false positives from lighting changes. Increase `MOTION_COOLDOWN` to limit alert frequency. Note that each alert now records for `VIDEO_DURATION` seconds, during which no new motion is detected, so the effective gap between alerts is roughly `MOTION_COOLDOWN` + `VIDEO_DURATION`.
 
@@ -88,6 +92,16 @@ A Telegram bot accepts messages from anyone who learns its username, so commands
 `TELEGRAM_ALLOWED_USERS` holds the numeric user IDs permitted to issue commands. It defaults to `TELEGRAM_CHAT_ID`, which for a private chat is also the owner's user ID, so a single-user setup needs no extra configuration. If `TELEGRAM_CHAT_ID` is a group (a negative ID), it is not a user ID and the allowlist must be set explicitly — the bot refuses to start otherwise rather than fall back to something permissive.
 
 Commands from anyone else are rejected with a short reply and logged at `WARNING` with the sender's ID, username, and name, so repeated attempts show up in `journalctl -u camera-bot`. The command menu is published only to allowed users; everyone else sees an empty list instead of a description of the camera. Note that this restricts commands, not alerts — motion clips always go to `TELEGRAM_CHAT_ID`.
+
+### Low light
+
+Darkness compresses contrast: a person at night differs from the background by a few grey levels rather than tens, so a detector tuned for daylight simply stops seeing anything. Two things address that.
+
+The sensor is allowed to lengthen its exposure when light is scarce (`CAMERA_LOW_LIGHT`, on by default), trading frame rate for the light it needs. This is a UVC control with no OpenCV property, so it is applied through `v4l2-ctl`; if that is missing the bot logs a warning and carries on.
+
+More importantly, the per-pixel difference that counts as "changed" is no longer fixed. It was hard-coded at 25, while a static scene measures a frame-to-frame noise peak of about 3 grey levels — roughly eight times more margin than the noise called for. Since sensitivity tracks the threshold one for one, that directly set the faintest detectable object at 25 levels of contrast. The threshold is now `MOTION_NOISE_MARGIN` times the noise the camera is actually producing, measured only on frames where nothing is happening so that real movement never inflates it, and clamped between `MOTION_THRESHOLD_MIN` and `MOTION_THRESHOLD_MAX`. The estimate rises quickly and decays slowly, so a sensor that gets noisy raises the bar at once but one quiet moment cannot make the detector jumpy.
+
+In practice the threshold settles around 9 on a quiet camera — about 2.8x more sensitive than before — and climbs back towards the ceiling under heavy noise. Because `MOTION_THRESHOLD_MAX` is the old fixed value, detection can never end up less sensitive than it was. `journalctl -u camera-bot` reports every change as `Pixel threshold now N (noise peak X, scene brightness Y)`, which is the quickest way to see what the camera is doing after dark.
 
 ### Focus and false positives
 
