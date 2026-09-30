@@ -21,8 +21,14 @@ from io import BytesIO
 
 import cv2
 from dotenv import load_dotenv
-from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import BotCommand, BotCommandScopeChat, Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 load_dotenv()
 
@@ -47,6 +53,33 @@ def _env_bool(name: str, default: bool) -> bool:
 BOT_TOKEN       = _require_env("TELEGRAM_BOT_TOKEN")
 CHAT_ID         = _require_env("TELEGRAM_CHAT_ID")
 CAMERA_INDEX    = int(os.getenv("CAMERA_INDEX", "0"))
+
+
+def _allowed_users() -> set[int]:
+    """
+    Telegram user IDs permitted to issue commands.
+
+    A bot is reachable by anyone who learns its username, so without this
+    every stranger could run /photo and /video and watch the room, or
+    /motion_off and silence the alarm. Defaults to the alert recipient: for a
+    private chat Telegram uses the same ID for the chat and the user, so the
+    owner stays in without configuring anything. A negative TELEGRAM_CHAT_ID
+    is a group, whose ID is not a user ID, so that case must be spelled out.
+    """
+    raw = os.getenv("TELEGRAM_ALLOWED_USERS", "")
+    ids = {int(part) for part in raw.replace(",", " ").split() if part.strip("-").isdigit()}
+    if ids:
+        return ids
+    if CHAT_ID.isdigit():
+        return {int(CHAT_ID)}
+    sys.exit(
+        "ERROR: TELEGRAM_CHAT_ID is a group, so it cannot double as the "
+        "command allowlist. Set TELEGRAM_ALLOWED_USERS to the numeric user "
+        "IDs allowed to control the bot."
+    )
+
+
+ALLOWED_USERS = _allowed_users()
 MOTION_MIN_AREA = int(os.getenv("MOTION_MIN_AREA", "3000"))  # pixels²
 MOTION_COOLDOWN = int(os.getenv("MOTION_COOLDOWN", "10"))    # seconds between alerts
 VIDEO_DURATION  = int(os.getenv("VIDEO_DURATION", "5"))      # seconds captured by /video
@@ -578,6 +611,24 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Recording a {VIDEO_DURATION}s video…")
 
 
+async def cmd_denied(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Catches commands from everyone outside ALLOWED_USERS. Logged at WARNING
+    with the sender's identity, since repeated hits are worth noticing on a
+    camera that watches a home.
+    """
+    user = update.effective_user
+    logger.warning(
+        "Rejected %s from unauthorised user %s (@%s, %s)",
+        update.message.text.split()[0] if update.message and update.message.text else "command",
+        user.id if user else "unknown",
+        user.username if user else "unknown",
+        user.full_name if user else "unknown",
+    )
+    if update.message:
+        await update.message.reply_text("Not authorised.")
+
+
 # ---------------------------------------------------------------------------
 # Application bootstrap
 # ---------------------------------------------------------------------------
@@ -602,13 +653,27 @@ async def _post_init(application: Application) -> None:
     _motion_thread.start()
     logger.info("Motion-detection thread started")
 
-    await application.bot.set_my_commands([
+    commands = [
         BotCommand("photo",          "Capture a photo on demand"),
         BotCommand("video",          "Capture a short video on demand"),
         BotCommand("motion_on",      "Enable motion detection"),
         BotCommand("motion_off",     "Disable motion detection"),
         BotCommand("motion_status",  "Show motion detection state"),
-    ])
+    ]
+    # Advertise the menu only to the people allowed to use it; everyone else
+    # gets an empty command list rather than a description of the camera.
+    await application.bot.set_my_commands([])
+    for user_id in sorted(ALLOWED_USERS):
+        try:
+            await application.bot.set_my_commands(
+                commands, scope=BotCommandScopeChat(chat_id=user_id)
+            )
+        except Exception as exc:
+            # Telegram rejects the scope until the user has opened a chat
+            # with the bot; the commands still work, they are just unlisted.
+            logger.warning("Could not publish command list to user %s: %s", user_id, exc)
+
+    logger.info("Commands restricted to %d authorised user(s)", len(ALLOWED_USERS))
 
 
 async def _post_shutdown(application: Application) -> None:
@@ -636,12 +701,15 @@ def main() -> None:
         .post_shutdown(_post_shutdown)
         .build()
     )
-    app.add_handler(CommandHandler("start",          cmd_start))
-    app.add_handler(CommandHandler("photo",          cmd_photo))
-    app.add_handler(CommandHandler("video",          cmd_video))
-    app.add_handler(CommandHandler("motion_on",      cmd_motion_on))
-    app.add_handler(CommandHandler("motion_off",     cmd_motion_off))
-    app.add_handler(CommandHandler("motion_status",  cmd_motion_status))
+    authorised = filters.User(user_id=ALLOWED_USERS)
+    app.add_handler(CommandHandler("start",          cmd_start,         filters=authorised))
+    app.add_handler(CommandHandler("photo",          cmd_photo,         filters=authorised))
+    app.add_handler(CommandHandler("video",          cmd_video,         filters=authorised))
+    app.add_handler(CommandHandler("motion_on",      cmd_motion_on,     filters=authorised))
+    app.add_handler(CommandHandler("motion_off",     cmd_motion_off,    filters=authorised))
+    app.add_handler(CommandHandler("motion_status",  cmd_motion_status, filters=authorised))
+    # Registered last so it only sees commands the handlers above declined.
+    app.add_handler(MessageHandler(filters.COMMAND & ~authorised, cmd_denied))
 
     logger.info("Starting camera bot")
     app.run_polling(drop_pending_updates=True)

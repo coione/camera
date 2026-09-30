@@ -68,6 +68,7 @@ All settings are controlled via environment variables (`.env` file):
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | **required** | Bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | **required** | Target chat or user ID for alerts |
+| `TELEGRAM_ALLOWED_USERS` | *(`TELEGRAM_CHAT_ID`)* | Comma-separated user IDs allowed to issue commands |
 | `CAMERA_INDEX` | `0` | OpenCV camera index (`0` = first USB camera) |
 | `MOTION_MIN_AREA` | `3000` | Minimum contour area in pixels² to trigger an alert |
 | `MOTION_COOLDOWN` | `10` | Minimum seconds between consecutive motion alerts |
@@ -79,6 +80,14 @@ All settings are controlled via environment variables (`.env` file):
 | `MOTION_CONSEC_FRAMES` | `3` | Readings in a row (~0.1 s each) that must show motion before alerting |
 
 Increase `MOTION_MIN_AREA` to reduce false positives from lighting changes. Increase `MOTION_COOLDOWN` to limit alert frequency. Note that each alert now records for `VIDEO_DURATION` seconds, during which no new motion is detected, so the effective gap between alerts is roughly `MOTION_COOLDOWN` + `VIDEO_DURATION`.
+
+### Access control
+
+A Telegram bot accepts messages from anyone who learns its username, so commands are restricted to an allowlist. Without it a stranger could run `/photo` or `/video` and watch the room, or `/motion_off` and silence the alarm.
+
+`TELEGRAM_ALLOWED_USERS` holds the numeric user IDs permitted to issue commands. It defaults to `TELEGRAM_CHAT_ID`, which for a private chat is also the owner's user ID, so a single-user setup needs no extra configuration. If `TELEGRAM_CHAT_ID` is a group (a negative ID), it is not a user ID and the allowlist must be set explicitly — the bot refuses to start otherwise rather than fall back to something permissive.
+
+Commands from anyone else are rejected with a short reply and logged at `WARNING` with the sender's ID, username, and name, so repeated attempts show up in `journalctl -u camera-bot`. The command menu is published only to allowed users; everyone else sees an empty list instead of a description of the camera. Note that this restricts commands, not alerts — motion clips always go to `TELEGRAM_CHAT_ID`.
 
 ### Focus and false positives
 
